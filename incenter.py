@@ -535,8 +535,8 @@ def plot_centroid(polygon):
 
 # 主函数
 def main(points):
-    # file_name = 'merged_building.shp'  # 读取合并后的shp文件
-    # points = read_shp_data(file_name)
+    file_name = 'path/to/your/file.shp'  # 读取合并后的shp文件
+    points = read_shp_data(file_name)
 
     if points is not None:
         print(f"Read {len(points)} points.")
@@ -640,5 +640,5 @@ def main(points):
 
 
 
-# incenter = main()
-# print(incenter)
+incenter = main(None)
+print(incenter)
