@@ -1,9 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import Delaunay
-from shapely.geometry import Polygon, LineString
+from scipy.spatial import Delaunay, ConvexHull
+from shapely.geometry import Polygon, LineString, Point
 import networkx as nx
-from scipy.spatial import ConvexHull
+import geopandas as gpd
+from pyproj import Transformer
+from collections import deque
 
 
 # 数据读取函数
@@ -18,6 +20,41 @@ def read_data(file_name):
         print(f"File '{file_name}' not found.")
         return None
     return np.array(points)
+
+
+def read_shp_data(file_name):
+    try:
+        # 读取shp文件
+        gdf = gpd.read_file(file_name)
+
+        # 创建一个用于从 WGS84 (经纬度, EPSG:4326) 转换到 Web Mercator (以米为单位, EPSG:3857) 的转换器
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+        # 假设每个Polygon对象是一个MultiPolygon或Polygon
+        polygons = gdf.geometry
+        print(polygons)
+
+        # 提取所有多边形的坐标点，并进行坐标转换
+        points = []
+        for poly in polygons:
+            if poly.is_valid:
+                # 检查是否是MultiPolygon
+                if poly.geom_type == 'MultiPolygon':
+                    for sub_poly in poly:
+                        # 将每个多边形的经纬度坐标转换为以米为单位的坐标
+                        transformed_coords = [transformer.transform(x, y) for x, y in sub_poly.exterior.coords]
+                        points.extend(transformed_coords)
+                else:
+                    # 将多边形的经纬度坐标转换为以米为单位的坐标
+                    transformed_coords = [transformer.transform(x, y) for x, y in poly.exterior.coords]
+                    points.extend(transformed_coords)
+
+        # 将点转换为numpy数组
+        return np.array(points)
+
+    except FileNotFoundError:
+        print(f"File '{file_name}' not found.")
+        return None
 
 # 计算凸包面积
 def convex_hull_area(points):
@@ -34,6 +71,7 @@ def polygon_area(points):
 
 def calculate_delta(tri_coords, polygon):
     polygonarea = polygon.area
+    # print(polygonarea)
 
     # 创建 Polygon 对象
     triangle = Polygon(tri_coords)
@@ -41,7 +79,7 @@ def calculate_delta(tri_coords, polygon):
     # 确保三角形在多边形内，否则将不进行计算
     if not polygon.contains(triangle):
         print("三角形不在多边形内，无法计算。")
-        return
+        return 1
 
     # 使用 difference() 函数将多边形减去三角形，得到剩余部分
     remaining_area = polygon.difference(triangle)
@@ -53,7 +91,7 @@ def calculate_delta(tri_coords, polygon):
         areas = [remaining_area.area]
 
     target_area = polygonarea / 3
-    # # 输出每个部分的面积
+    # 输出每个部分的面积
     # for i, area in enumerate(areas):
     #     print(f"Part {i + 1} area: {area}")
     delta = 0.5 * sum((area - target_area) ** 2 for area in areas)
@@ -74,7 +112,8 @@ def filter_triangles(triangles, polygon):
     filtered_triangles = []
     for triangle in triangles:
         intersection_area = triangle.intersection(polygon).area  # 计算相交面积
-        if intersection_area > 0:  # 仅保留相交面积大于0的三角形
+        triangle_area = triangle.area
+        if intersection_area == triangle_area:  # 仅保留相交面积大于0的三角形
             filtered_triangles.append(triangle)
     return filtered_triangles
 
@@ -139,6 +178,7 @@ def triangle_delta(triangle_boundaries, polygon_lines, polygon):
 
             # 将 delta 和 tri_centroid 存入字典
             delta_centroid_dict[delta] = tri_centroid
+            # print(delta_centroid_dict)
 
     # 返回字典
     return delta_centroid_dict
@@ -257,6 +297,7 @@ def classify_triangles(intersections_count):
     return class_1, class_2, class_3
 
 def GenSkeleton(middlepoints):
+    print("start creating corner skeleton")
     skeleton = []  # 存储多个中点的列表
 
     # 主循环：不断从 middlepoints 中查找仅包含一个中点的列表，直到 middlepoints 中所有列表长度不为 1
@@ -298,43 +339,58 @@ def GenSkeleton(middlepoints):
         if separate_skeleton:
             skeleton.append(separate_skeleton.copy())  # 添加副本，保留原内容
             separate_skeleton.clear()  # 清空 separate_skeleton 列表
+        print(len(middlepoints))
+        # plot_skeleton(skeleton)
+        # plot_triangles(filtered_triangles, intersections_count)
+        # plt.savefig("test.png")
+
 
     return skeleton, middlepoints
 
-def get_middle_skeleton(new_middlepoints, skeleton):
-    while len(new_middlepoints) > 1:  # 继续执行，直到 new_middlepoints 的长度为 1
+
+def get_middle_skeleton(new_middlepoints, skeleton, filtered_triangles, intersections_count):
+    print("start creating middle skeleton")
+
+    # 用 deque 存储最近 5 次的 new_middlepoints 长度
+    recent_lengths = deque(maxlen=5)
+
+    while len(new_middlepoints) > 1:
+        # 记录当前 new_middlepoints 的长度
+        recent_lengths.append(len(new_middlepoints))
+
+        # 如果最近 5 次长度都相同，直接返回 skeleton
+        if len(recent_lengths) == 5 and len(set(recent_lengths)) == 1:
+            print("The length of new_middlepoints has been the same for 5 consecutive loops, exiting early.")
+            return new_middlepoints, skeleton
+
         for idx, midpoints_list in enumerate(new_middlepoints):
-            if len(midpoints_list) == 3:  # 找到长度为 3 的列表
-                matching_points = []  # 存储找到的相同元素
+            if len(midpoints_list) == 3:
+                matching_points = []
                 middle_skeleton = []
 
-                # 遍历 skeleton 中的所有列表，查找有无与 midpoints_list 相同的元素
                 for skeleton_list in skeleton:
                     for point in midpoints_list:
                         if point in skeleton_list:
-                            matching_points.append(point)  # 添加相同的元素到 matching_points
+                            matching_points.append(point)
 
-                # 如果在 skeleton 中找到两个相同的元素
                 if len(matching_points) == 2:
-                    # 计算质心
                     centroid = class_3_center_midpoints(midpoints_list)
-                    # 从 midpoints_list 中删除这两个相同的元素
                     midpoints_list = [point for point in midpoints_list if point not in matching_points]
 
-                    # 只要找到一个 midpoints_list 匹配，替换后立即结束循环
                     new_middlepoints[idx] = midpoints_list
-                    break  # 终止循环，停止进一步查找
+                    break
 
-        # 对处理后的 new_middlepoints 再次执行 GenSkeleton 操作
         skeleton_middle, new_middlepoints = GenSkeleton(new_middlepoints)
         skeleton_middle = [item for sublist in skeleton_middle for item in sublist]
-        skeleton_middle.insert(0, centroid)  # 将质心插入 skeleton_middle 的首位
-        skeleton.append(skeleton_middle)  # 将 skeleton_middle 添加到 skeleton 中
+        skeleton_middle.insert(0, centroid)
+        skeleton.append(skeleton_middle)
+        print(len(new_middlepoints))
 
     return new_middlepoints, skeleton
 
 
 def find_split_point(coordinate_lists):
+    print("start creating graph")
     # 创建一个无向图
     G = nx.Graph()
 
@@ -394,6 +450,7 @@ def find_split_point(coordinate_lists):
     return split_point.tolist()
 
 def plot_triangles(filtered_triangles, intersections_count):
+    print("start drawing triangles")
     # 为每一类三角形指定不同的颜色
     colors = {1: 'green', 2: 'blue', 3: 'red'}
 
@@ -401,20 +458,23 @@ def plot_triangles(filtered_triangles, intersections_count):
         count = intersections_count[i]
         color = colors.get(count, 'black')  # 默认颜色为黑色
         x, y = triangle.exterior.xy
-        plt.fill(x, y, alpha=0.5, fc=color, ec='black')  # 绘制三角形
+        plt.fill(x, y, alpha=0.2, fc=color, ec='black')  # 绘制三角形
 def plot_skeleton(skeleton):
+    print("start drawing skeleton")
     # 遍历每条折线
     for line in skeleton:
         # 将每条线的点分开为 x 和 y 坐标
         x_values = [point[0] for point in line]
         y_values = [point[1] for point in line]
 
-        plt.plot(x_values, y_values, marker='o')  # 绘制折线，带上点标记
+        # plt.plot(x_values, y_values, marker='o', color='blue')  # 绘制折线，带上点标记
 def plot_polygon(polygon):
+    print("start drawing polygon")
     x, y = polygon.exterior.xy  # 获取多边形外部的x和y坐标
     plt.fill(x, y, alpha=0.5, fc='lightblue', ec='black')  # 绘制多边形
 
 def plot_graph(coordinate_lists, split_point):
+    print("start drawing graph")
     # 创建无向图
     G = nx.Graph()
 
@@ -448,25 +508,35 @@ def plot_graph(coordinate_lists, split_point):
 
     # 绘制图形
     pos = {coord: coord for coord in G.nodes()}  # 节点位置
-    nx.draw(G, pos, with_labels=False, node_size=10, node_color='lightblue', font_size=10)
+    nx.draw(G, pos, with_labels=False, node_size=3, node_color='lightblue', font_size=1)
 
     # 突出显示最远节点的路径
     if longest_path:
         path_edges = list(zip(longest_path[:-1], longest_path[1:]))
-        nx.draw_networkx_edges(G, pos, edgelist=path_edges, edge_color='red', width=3)
+        nx.draw_networkx_edges(G, pos, edgelist=path_edges, edge_color='red', width=2)
 
     # 标记均分点
     if split_point is not None:
-        plt.plot(split_point[0], split_point[1], 'go', markersize=10)  # 绿色圆点
-        plt.text(split_point[0], split_point[1], 'Incenter', fontsize=15, ha='right')
+        plt.plot(split_point[0], split_point[1], 'ro', markersize=10, label="内心")  # 绿色圆点
+        # plt.text(split_point[0], split_point[1]+20, 'Incenter', fontsize=15, ha='center')
+        plt.legend()
+
+def plot_centroid(polygon):
+    centroid = polygon.centroid
+    xmin, ymin, xmax, ymax = polygon.bounds
+    plt.plot(centroid.x, centroid.y, marker='o', markersize=10, color="green", label="重心")
+    # plt.text(centroid.x, centroid.y+20, 'Centroid', fontsize=15, ha='center')
+    plt.plot((xmin + xmax)/2, (ymin + ymax)/2, marker='*', markersize=10, color="green", label="MBR中心")
+    # plt.text((xmin + xmax)/2, (ymin + ymax)/2+20, 'C$_E$', fontsize=15, ha='center', wrap=True)
+    plt.legend()
 
 
 
 
 # 主函数
-def main():
-    file_name = 'data.txt'
-    points = read_data(file_name)
+def main(points):
+    # file_name = 'merged_building.shp'  # 读取合并后的shp文件
+    # points = read_shp_data(file_name)
 
     if points is not None:
         print(f"Read {len(points)} points.")
@@ -482,6 +552,7 @@ def main():
 
         if area_ratio > 0.85:
             print(f"内心坐标: {centroid.x}, {centroid.y}")
+            return centroid
         else:
             # 过滤相交面积为0的三角形
             filtered_triangles = filter_triangles(triangles, polygon)
@@ -496,10 +567,19 @@ def main():
             intersections_count, common_vertices = count_intersections(triangle_boundaries, polygon_lines)
             delta_centroid_dict = triangle_delta(triangle_boundaries, polygon_lines, polygon)
             # print(delta_centroid_dict)
+            # 分类三角形
+            class_1, class_2, class_3 = classify_triangles(intersections_count)
+
+            # 输出每一类三角形的个数
+            print(f"Class 1 triangles (intersections_count = 2): {len(class_1)}")
+            print(f"Class 2 triangles (intersections_count = 1): {len(class_2)}")
+            print(f"Class 3 triangles (intersections_count = 0): {len(class_3)}")
 
             min_delta = min(delta_centroid_dict.keys())
             print(f"最小的delta为{min_delta}")
             tri_centroid = delta_centroid_dict[min_delta]  # 对应的三角形质心
+
+
 
             # 判断最小的 delta 是否大于 0.65
             if min_delta > 0.65:
@@ -512,36 +592,53 @@ def main():
                 skeleton = insert_vertices(skeleton, common_vertices)
 
                 # 获取节点三角形到节点三角形的骨架
-                new_middlepoints, skeleton = get_middle_skeleton(new_middlepoints, skeleton)
+                new_middlepoints, skeleton = get_middle_skeleton(new_middlepoints, skeleton, filtered_triangles, intersections_count)
+                plot_triangles(filtered_triangles, intersections_count)
+                plot_skeleton(skeleton)
+                plt.show()
                 split_point = find_split_point(skeleton)
                 print("内心坐标:", split_point)
 
-                # 分类三角形
-                class_1, class_2, class_3 = classify_triangles(intersections_count)
-
-                # 输出每一类三角形的个数
-                print(f"Class 1 triangles (intersections_count = 2): {len(class_1)}")
-                print(f"Class 2 triangles (intersections_count = 1): {len(class_2)}")
-                print(f"Class 3 triangles (intersections_count = 0): {len(class_3)}")
-
                 # 绘制图形
+                plt.rcParams['font.sans-serif'] = ['SimHei']
+                plt.rcParams['axes.unicode_minus'] = False
                 plot_polygon(polygon)
                 plot_skeleton(skeleton)
+                plot_centroid(polygon)
                 plot_triangles(filtered_triangles, intersections_count)
                 plot_graph(skeleton, split_point)
-                plt.plot(points[:, 0], points[:, 1], 'o', markersize=5, color='red')  # 绘制点
+                plt.plot(points[:, 0], points[:, 1], 'o', markersize=2, color='red')  # 绘制点
                 plt.xlabel('X')
                 plt.ylabel('Y')
                 plt.grid()
                 plt.show()
 
+                point = Point(split_point)
+                return point
+
             else:
                 # 输出三角形质心
                 print(f"内心坐标为 {tri_centroid}")
+
+                # 绘制图形
+                plt.rcParams['font.sans-serif'] = ['SimHei']
+                plt.rcParams['axes.unicode_minus'] = False
+                plot_polygon(polygon)
+                plot_centroid(polygon)
+                plot_triangles(filtered_triangles, intersections_count)
+                plt.plot(points[:, 0], points[:, 1], 'o', markersize=2, color='red')  # 绘制点
+                plt.plot(tri_centroid.x, tri_centroid.y, 'ro', markersize=10, label='Incenter')
+                plt.xlabel('X')
+                plt.ylabel('Y')
+                plt.legend()
+                plt.grid()
+                plt.show()
+                return tri_centroid
     else:
         print("No points to process.")
 
 
 
-if __name__ == "__main__":
-    main()
+
+# incenter = main()
+# print(incenter)
